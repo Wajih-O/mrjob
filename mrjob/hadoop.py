@@ -92,7 +92,7 @@ def fully_qualify_hdfs_path(path):
         return 'hdfs:///user/%s/%s' % (getpass.getuser(), path)
 
 
-def hadoop_log_dir(hadoop_home=None):
+def hadoop_log_dir(hadoop_home=None, output_dir=None):
     """Return the path where Hadoop stores logs.
 
     :param hadoop_home: putative value of :envvar:`HADOOP_HOME`, or None to
@@ -102,6 +102,8 @@ def hadoop_log_dir(hadoop_home=None):
     try:
         return os.environ['HADOOP_LOG_DIR']
     except KeyError:
+        if output_dir:
+            return posixpath.join(output_dir, '_logs')
         # Defaults to $HADOOP_HOME/logs
         # http://wiki.apache.org/hadoop/HowToConfigure
         if hadoop_home is None:
@@ -194,11 +196,11 @@ class HadoopJobRunner(MRJobRunner):
 
         self._hadoop_log_dir = hadoop_log_dir(self._opts['hadoop_home'])
 
-        # Running jobs via hadoop assigns a new timestamp to each job.
-        # Running jobs via mrjob only adds steps.
-        # Store both of these values to enable log parsing.
-        self._job_timestamp = None
-        self._start_step_num = 0
+        # # Running jobs via hadoop assigns a new timestamp to each job.
+        # # Running jobs via mrjob only adds steps.
+        # # Store both of these values to enable log parsing.
+        # self._job_timestamp = None
+        # self._start_step_num = 0
 
         # init hadoop version cache
         self._hadoop_version = None
@@ -305,6 +307,7 @@ class HadoopJobRunner(MRJobRunner):
 
     def _run_job_in_hadoop(self):
         self._counters = []
+        self._step_ids = [None] * len(self._get_steps())
 
         for step_num in xrange(self._num_steps()):
             log.debug('running step %d of %d' %
@@ -321,7 +324,7 @@ class HadoopJobRunner(MRJobRunner):
                 # no PTYs, just use Popen
                 step_proc = Popen(step_args, stdout=PIPE, stderr=PIPE)
 
-                self._process_stderr_from_streaming(step_proc.stderr)
+                self._process_stderr_from_streaming(step_proc.stderr, step_num)
 
                 # there shouldn't be much output to STDOUT
                 for line in step_proc.stdout:
@@ -336,13 +339,13 @@ class HadoopJobRunner(MRJobRunner):
                     master = os.fdopen(master_fd)
                     # reading from master gives us the subprocess's
                     # stderr and stdout (it's a fake terminal)
-                    self._process_stderr_from_streaming(master)
+                    self._process_stderr_from_streaming(master, step_num)
                     _, returncode = os.waitpid(pid, 0)
                     master.close()
 
             if returncode == 0:
                 # parsing needs step number for whole job
-                self._fetch_counters([step_num + self._start_step_num])
+                self._fetch_counters(step_num)#[step_num + self._start_step_num])
                 # printing needs step number relevant to this run of mrjob
                 self.print_counters([step_num + 1])
             else:
@@ -534,37 +537,70 @@ class HadoopJobRunner(MRJobRunner):
 
                 yield path
 
-    def _ls_logs(self, relative_path):
+    # def _ls_logs(self, relative_path):
+    #     """List logs on the local filesystem by path relative to log root
+    #     directory
+    #     """
+    #     return self.ls(os.path.join(self._hadoop_log_dir, relative_path))
+
+
+
+    # def _fetch_counters(self, step_nums, skip_s3_wait=False):
+    #     """Read Hadoop counters from local logs.
+
+    #     Args:
+    #     step_nums -- the steps belonging to us, so that we can ignore errors
+    #                  from other jobs run with the same timestamp
+    #     """
+    #     job_logs = self._enforce_path_regexp(self._ls_logs('history/'),
+    #                                          HADOOP_JOB_LOG_URI_RE,
+    #                                          step_nums)
+    #     uris = list(job_logs)
+    #     new_counters = scan_for_counters_in_files(uris, self,
+    #                                               self.get_hadoop_version())
+
+    #     # only include steps relevant to the current job
+    #     for step_num in step_nums:
+    #         self._counters.append(new_counters.get(step_num, {}))
+
+    def _ls_logs(self, relative_path, step_num):
         """List logs on the local filesystem by path relative to log root
         directory
         """
-        return self.ls(os.path.join(self._hadoop_log_dir, relative_path))
+        log_dir = hadoop_log_dir(output_dir=self._hdfs_step_output_dir(step_num))
+        return self.ls(os.path.join(log_dir, relative_path))
 
-    def _fetch_counters(self, step_nums, skip_s3_wait=False):
+
+    def _fetch_counters(self, step_num, skip_s3_wait=False):
         """Read Hadoop counters from local logs.
 
         Args:
         step_nums -- the steps belonging to us, so that we can ignore errors
                      from other jobs run with the same timestamp
         """
-        job_logs = self._enforce_path_regexp(self._ls_logs('history/'),
+        job_logs = self._enforce_path_regexp(self._ls_logs('history/', step_num),
                                              HADOOP_JOB_LOG_URI_RE,
-                                             step_nums)
+                                             [self._step_ids[step_num]])
         uris = list(job_logs)
         new_counters = scan_for_counters_in_files(uris, self,
                                                   self.get_hadoop_version())
 
         # only include steps relevant to the current job
-        for step_num in step_nums:
-            self._counters.append(new_counters.get(step_num, {}))
+        # for step_num in step_nums:
+        #     self._counters.append(new_counters.get(step_num, {}))
+        hadoop_step_num = int(self._step_ids[step_num].split('_')[-1])
+        self._counters.appends(new_counters.get(hadoop_step_num,{}))
+
+
 
     def counters(self):
         return self._counters
 
-    def _find_probable_cause_of_failure(self, step_nums):
+    def _find_probable_cause_of_failure(self, step_num):
         all_task_attempt_logs = []
+        step_nums = [self._step_ids[step_num]]
         try:
-            all_task_attempt_logs.extend(self._ls_logs('userlogs/'))
+            all_task_attempt_logs.extend(self._ls_logs('userlogs/', step_num))
         except IOError:
             # sometimes the master doesn't have these
             pass
@@ -572,10 +608,10 @@ class HadoopJobRunner(MRJobRunner):
         task_attempt_logs = self._enforce_path_regexp(all_task_attempt_logs,
                                                       TASK_ATTEMPTS_LOG_URI_RE,
                                                       step_nums)
-        step_logs = self._enforce_path_regexp(self._ls_logs('steps/'),
+        step_logs = self._enforce_path_regexp(self._ls_logs('steps/', step_num),
                                               STEP_LOG_URI_RE,
                                               step_nums)
-        job_logs = self._enforce_path_regexp(self._ls_logs('history/'),
+        job_logs = self._enforce_path_regexp(self._ls_logs('history/', step_num),
                                              HADOOP_JOB_LOG_URI_RE,
                                              step_nums)
         log.info('Scanning logs for probable cause of failure')
